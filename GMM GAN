@@ -1,0 +1,315 @@
+import pickle
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from tqdm import tqdm
+from matplotlib import pyplot as plt
+from sklearn.neighbors import NearestNeighbors
+import os.path
+import torch.utils.data as data_utils
+import time
+import re
+import seaborn as sns
+from sklearn.mixture import GaussianMixture
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+PATH_gan = r"C:\Users\netam\Documents\Python Scripts\gan_project"
+
+class GeneratorB(nn.Module):
+    def __init__(self):
+        super(GeneratorB, self).__init__()
+        self.fc1 = nn.Linear(6, 32)
+        torch.nn.init.normal_(self.fc1.weight, mean=0.0, std=(2/6)**0.5)
+        self.fc2 = nn.Linear(32, 16)
+        torch.nn.init.normal_(self.fc2.weight, mean=0.0, std=(2/32)**0.5)
+        self.fc3 = nn.Linear(16, 8)
+        torch.nn.init.normal_(self.fc3.weight, mean=0.0, std=(2/16)**0.5)
+        self.fc4 = nn.Linear(8, 5)
+        torch.nn.init.xavier_uniform(self.fc4.weight)
+
+    def forward(self, x, training=False):
+        x = F.leaky_relu(self.fc1(x))
+        x = F.leaky_relu(self.fc2(x))
+        x = F.leaky_relu(self.fc3(x))
+        x = torch.tanh(self.fc4(x))
+        return x
+
+class DiscriminatorB(nn.Module):
+    def __init__(self):
+        super(DiscriminatorB, self).__init__()
+        self.fc1 = nn.Linear(5, 32)
+        torch.nn.init.normal_(self.fc1.weight, mean=0.0, std=(2/5)**0.5)
+        self.fc2 = nn.Linear(32, 16)
+        torch.nn.init.normal_(self.fc2.weight, mean=0.0, std=(2/32)**0.5)
+        self.fc3 = nn.Linear(16, 8)
+        torch.nn.init.normal_(self.fc3.weight, mean=0.0, std=(2/16)**0.5)
+        self.fc4 = nn.Linear(8, 6)
+        torch.nn.init.normal_(self.fc4.weight, mean=0.0, std=(2/8)**0.5)
+        self.fc5 = nn.Linear(6, 1)
+        torch.nn.init.xavier_uniform(self.fc5.weight)
+
+    def forward(self, x, training=False):
+        x = F.leaky_relu(self.fc1(x))
+        x = F.leaky_relu(self.fc2(x))
+        x = F.leaky_relu(self.fc3(x))
+        x = F.leaky_relu(self.fc4(x))
+        x = torch.sigmoid(self.fc5(x))
+        return x
+
+class GanModelB(nn.Module):
+    def __init__(self):
+        super(GanModelB, self).__init__()
+        self.generator = GeneratorB()
+        self.discriminator = DiscriminatorB()
+
+    def training_gan(self, trainloader, lr, beta1, b_size, epoch, epoch_dis, fixed_noise, opt_name):
+        try:
+            num_epochs = epoch
+            criterion = nn.BCELoss()
+            optimizerD = optim.Adam(self.discriminator.parameters(), lr=lr, betas=(beta1, 0.999))
+            optimizerG = optim.Adam(self.generator.parameters(), lr=lr, betas=(beta1, 0.999))
+
+            real_label = 1.0
+            fake_label = 0.
+
+            G_losses = []
+            D_losses = []
+            D_real_losses = []
+            D_fake_losses = []
+
+            for e in tqdm(range(1, num_epochs + 1)):
+                print(f"'Epoch {e}' ")
+                for j, (data, _) in enumerate(trainloader):
+                    for i in range(epoch_dis):
+                        data = data.to(device)
+                        # Update discriminator network
+                        ## Train with real batch
+                        self.discriminator.train()
+                        self.generator.eval()
+                        self.discriminator.zero_grad()
+                        real_features = data
+                        label = torch.full((int(real_features.size()[0]),), real_label, dtype=torch.float,
+                                           device=device)
+                        output = self.discriminator(real_features, training=True).view(-1)
+                        errD_real = criterion(output, label)
+                        errD_real.backward()
+                        dis_real = output.mean().item()
+                        ## Train with fake batch
+                        noise = torch.from_numpy(np.random.normal(0, 0.2, [int(real_features.size()[0]), 6])).type(
+                            torch.FloatTensor)
+                        noise = noise.to(device)
+                        fake = self.generator(noise, training=False)
+                        label.fill_(fake_label).type(torch.FloatTensor)
+                        output = self.discriminator(fake.detach(), training=True).view(-1)
+                        errD_fake = criterion(output, label)
+                        errD_fake.backward()
+                        dis_fake1 = output.mean().item()
+                        errD = errD_real + errD_fake
+                        optimizerD.step()
+
+                    # Update generator network:
+                    self.generator.train()
+                    self.discriminator.eval()
+                    self.generator.zero_grad()
+                    label = torch.full((int(real_features.size()[0]),), real_label, dtype=torch.float, device=device)
+                    noise = torch.from_numpy(np.random.normal(0, 0.2, [int(real_features.size()[0]), 6])).type(
+                        torch.FloatTensor)
+                    noise = noise.to(device)
+                    fake = self.generator(noise, training=True)
+                    output = self.discriminator(fake, training=False).view(-1)
+                    errG = criterion(output, label)
+                    errG.backward()
+                    dis_fake2 = output.mean().item()
+                    optimizerG.step()
+
+                    # Save Losses
+                    G_losses.append(errG.item())
+                    D_losses.append(errD.item())
+                    D_real_losses.append(errD_real.item())
+                    D_fake_losses.append(errD_fake.item())
+
+                    # Check losses
+                    if (e % 50 == 0) or (e == num_epochs):
+                        print (f"[{e}/{num_epochs}][{i}/{b_size}]\tLoss_D: {errD.item()} \tLoss_G:{errG.item()} \tDis_for_real_data:{dis_real} \tDis_for_fake_data:{dis_fake1}/ {dis_fake2}")
+        except:
+            torch.save(self, os.path.join(PATH_gan, str(opt_name) + ".pth"))
+        else:
+            print("Training is complete")
+            torch.save(self, os.path.join(PATH_gan, str(opt_name) + ".pth"))
+        return G_losses, D_losses, D_real_losses, D_fake_losses
+
+
+
+def loss_graph(G_losses, D_losses, D_real_losses, D_fake_losses, model_name):
+    plt.plot(range(len(G_losses)),G_losses, label='generator_loss')
+    plt.plot(range(len(D_losses)), D_losses, label='discriminator_loss')
+    plt.plot(range(len(D_real_losses)),D_real_losses, label='discriminator_real_loss')
+    plt.plot(range(len(D_fake_losses)), D_fake_losses, label='discriminator_fake_loss')
+    plt.legend()
+    plt.savefig(str(model_name)+' loss gen&dis.png')
+    plt.show()
+
+def GMM_division(data):
+    dataset = pd.DataFrame({'feature1': data[0][:,0], 'feature2': data[0][:,1]})
+    labels = pd.DataFrame({'target1': data[1][:, 0], 'target2': data[1][:, 1], 'target3': data[1][:, 2]})
+    print(dataset.isna().sum())
+    print(labels.isna().sum())
+
+    data_df = pd.concat([dataset, labels], axis=1)
+
+    gm2 = GaussianMixture(n_components=4).fit(data_df.iloc[:,2:])
+    membership_pro2=gm2.predict_proba(data_df.iloc[:,2:])
+    dis_index=np.argmax(membership_pro2, axis=1)
+    groups=[]
+    for i in range(0,4):
+        ind_i=np.where(dis_index==i)
+        groups.append(data_df.loc[ind_i[0].tolist(),:])
+
+    scaler1 = MinMaxScaler().fit(groups[0])
+    groups[0] = scaler1.transform(groups[0])
+    groups[0] = groups[0] - 0.5
+    scaler2 = MinMaxScaler().fit(groups[1])
+    groups[1] = scaler2.transform(groups[1])
+    groups[1] = groups[1] - 0.5
+    scaler3 = MinMaxScaler().fit(groups[2])
+    groups[2] = scaler3.transform(groups[2])
+    groups[2] = groups[2] - 0.5
+    scaler4 = MinMaxScaler().fit(groups[3])
+    groups[3] = scaler4.transform(groups[3])
+    groups[3] = groups[3] - 0.5
+
+    group1_df=pd.DataFrame({'feature1': groups[0][:,0], 'feature2': groups[0][:,1],'target1': groups[0][:,2], 'target2': groups[0][:,3], 'target3': groups[0][:,4]})
+    group2_df=pd.DataFrame({'feature1': groups[1][:,0], 'feature2': groups[1][:,1],'target1': groups[1][:,2], 'target2': groups[1][:,3], 'target3': groups[1][:,4]})
+    group3_df=pd.DataFrame({'feature1': groups[2][:,0], 'feature2': groups[2][:,1],'target1': groups[2][:,2], 'target2': groups[2][:,3], 'target3': groups[2][:,4]})
+    group4_df=pd.DataFrame({'feature1': groups[3][:,0], 'feature2': groups[3][:,1],'target1': groups[3][:,2], 'target2': groups[3][:,3], 'target3': groups[3][:,4]})
+
+    data_distribution(group1_df)
+    data_distribution(group2_df)
+    data_distribution(group3_df)
+    data_distribution(group4_df)
+
+    train_tensor1 = torch.tensor(groups[0]).type(torch.FloatTensor)
+    train_tensor2 = torch.tensor(groups[1]).type(torch.FloatTensor)
+    train_tensor3 = torch.tensor(groups[2]).type(torch.FloatTensor)
+    train_tensor4 = torch.tensor(groups[3]).type(torch.FloatTensor)
+    return train_tensor1, train_tensor2, train_tensor3, train_tensor4,scaler1,scaler2,scaler3,scaler4
+
+def data_distribution(group_df):
+    g = sns.heatmap(group_df[["feature1","feature2","target1","target2","target3"]].corr(),annot=True, fmt = ".2f", cmap = "coolwarm")
+    g.figure.savefig(PATH_gan + "\data1_heatmap.png")
+    g = sns.kdeplot(data=group_df, x="target1")
+    g.figure.savefig(PATH_gan + "\data1_target1.png")
+    g = sns.kdeplot(data=group_df, x="target2")
+    g.figure.savefig(PATH_gan + "\data1_target2.png")
+    g = sns.kdeplot(data=group_df, x="target3")
+    g.figure.savefig(PATH_gan + "\data1_target3.png")
+    g = sns.kdeplot(data=group_df, x="feature1")
+    g.figure.savefig(PATH_gan + "\data1_feature1.png")
+    g = sns.kdeplot(data=group_df, x="feature2")
+    g.figure.savefig(PATH_gan + "\data1_feature2.png")
+
+def gan_module_and_generate_data(train_tensor,train_dataloader, lr, beta_1, b_size, epoch ,epoch_dis, fixed_noise,opt_name,module_num,scaler,num_gan_data):
+    gan = GanModelB()
+    G_losses, D_losses, D_real_losses, D_fake_losses= gan.training_gan(train_dataloader, lr, beta_1, b_size, epoch ,epoch_dis, fixed_noise,opt_name+module_num)
+    loss_graph(G_losses, D_losses, D_real_losses, D_fake_losses, opt_name+module_num)
+
+    neigh = NearestNeighbors(n_neighbors=8, radius=0.3)
+    neigh.fit(train_tensor.numpy())
+    test= gan.generator(fixed_noise, training=False)
+    score = neigh.kneighbors(test.detach().numpy())
+    print("NearestNeighbors score for gan" +module_num+": "+str(score[0].mean()))
+
+    gan.eval()
+    noise = torch.from_numpy(np.random.uniform(-0.5, 0.5, [num_gan_data, 6])).type(torch.FloatTensor)
+    generated_data = gan.generator(noise, training=False)
+    generated_data = generated_data.data
+
+    gan_data = generated_data.detach().numpy()
+
+    gan_data_df = pd.DataFrame(
+        {'feature1': gan_data[:, 0], 'feature2': gan_data[:, 1], 'target1': gan_data[:, 2], 'target2': gan_data[:, 3],
+         'target3': gan_data[:, 4]})
+
+    gan_data_df.to_csv(opt_name+'_'+module_num+'.csv')
+    gan_data_df.to_pickle(PATH_gan+"./"+opt_name+'_'+module_num+".pkl")
+
+    gan_data_df_in = gan_data_df + 0.5
+    gan_data_inverse = scaler.inverse_transform(gan_data_df_in)
+    gan_data_df_inverse= pd.DataFrame(
+        {'feature1': gan_data_inverse[:, 0], 'feature2': gan_data_inverse[:, 1], 'target1': gan_data_inverse[:, 2], 'target2': gan_data_inverse[:, 3],
+         'target3': gan_data_inverse[:, 4]})
+    gan_data_df_inverse.to_csv('inverse_'+opt_name+'_'+module_num+ '.csv')
+    gan_data_df_inverse.to_pickle(PATH_gan + "./"+'inverse_'+opt_name + '_' + module_num + ".pkl")
+
+    g = sns.heatmap(gan_data_df[["feature1", "feature2", "target1", "target2", "target3"]].corr(), annot=True, fmt=".2f",
+                    cmap="coolwarm")
+    g.figure.savefig(PATH_gan + "\gan_data_heatmap" +opt_name+'_'+module_num+".png")
+    g = sns.kdeplot(data=gan_data_df, x="target1")
+    g.figure.savefig(PATH_gan + "\gan_data_target1" + opt_name + '_' + module_num + ".png")
+    g = sns.kdeplot(data=gan_data_df, x="target2")
+    g.figure.savefig(PATH_gan + "\gan_data_target2" + opt_name + '_' + module_num + ".png")
+    g = sns.kdeplot(data=gan_data_df, x="target3")
+    g.figure.savefig(PATH_gan + "\gan_data_target3" + opt_name + '_' + module_num + ".png")
+    g = sns.kdeplot(data=gan_data_df, x="feature1")
+    g.figure.savefig(PATH_gan + "\gan_data_feature1" + opt_name + '_' + module_num + ".png")
+    g = sns.kdeplot(data=gan_data_df, x="feature2")
+    g.figure.savefig(PATH_gan + "\gan_data_feature2" + opt_name + '_' + module_num + ".png")
+
+
+def process_data(data, batch_size):
+    train = data_utils.TensorDataset(data, data[:,2:])
+    train_loader = data_utils.DataLoader(train, batch_size = batch_size, num_workers=0,  shuffle = False)
+    return train_loader
+
+
+
+if __name__=='__main__':
+    # hyper-parameters
+    num_gan_data=100000
+    t = time.asctime()
+    file_name = str(re.sub(r":" ,"_" ,t))
+    file_name = "28.7_dis1_b128_1000epoch_basic_4groups "+file_name
+    model_dic= {'b_size': 128, 'lr': 0.0002,'beta_1': 0.4, 'epoch_dis': 1,'name_option': file_name}
+
+    b_size = model_dic["b_size"]
+    lr = model_dic["lr"]
+    beta_1 = model_dic["beta_1"]
+    epoch_dis = model_dic["epoch_dis"]
+    opt_name = model_dic["name_option"]
+
+    t= open(r"C:\Users\netam\Documents\Python Scripts\gan_project\train.pkl", 'rb')
+    data=pickle.load(t)
+
+    #Split the train data into four sub-groups according to the target distribution(GMM) and plot their features and targets distribution
+    train_tensor1, train_tensor2, train_tensor3, train_tensor4 , scaler1, scaler2, scaler3, scaler4 = GMM_division(data)
+    #from tensor to dataloader
+    train1_dataloader = process_data(train_tensor1, b_size)
+    train2_dataloader = process_data(train_tensor2, b_size)
+    train3_dataloader = process_data(train_tensor3, b_size)
+    train4_dataloader = process_data(train_tensor4, b_size)
+
+    epoch1= 250
+    epoch2 = 250
+    epoch3 = 250
+    epoch4 = 250
+
+    #creating four different GAN for each sub-group, generate data, and examining the result according to distribution plots
+    fixed_noise = torch.from_numpy(np.random.uniform(-0.5, 0.5, [b_size, 6])).type(torch.FloatTensor)
+    gan_module_and_generate_data(train_tensor1, train1_dataloader, lr, beta_1, b_size, epoch1, epoch_dis,
+                                     fixed_noise, opt_name, "_1_", scaler1, num_gan_data)
+
+    fixed_noise = torch.from_numpy(np.random.uniform(-0.5, 0.5, [b_size, 6])).type(torch.FloatTensor)
+    gan_module_and_generate_data(train_tensor2, train2_dataloader, lr, beta_1, b_size, epoch2, epoch_dis,
+                                     fixed_noise, opt_name, "_2_", scaler2, num_gan_data)
+
+    fixed_noise = torch.from_numpy(np.random.uniform(-0.5, 0.5, [b_size, 6])).type(torch.FloatTensor)
+    gan_module_and_generate_data(train_tensor3, train3_dataloader, lr, beta_1, b_size, epoch3, epoch_dis,
+                                     fixed_noise, opt_name, "_3_", scaler3, num_gan_data)
+
+    fixed_noise = torch.from_numpy(np.random.uniform(-0.5, 0.5, [b_size, 6])).type(torch.FloatTensor)
+    gan_module_and_generate_data(train_tensor4, train4_dataloader, lr, beta_1, b_size, epoch4, epoch_dis,
+                                     fixed_noise, opt_name, "_4_", scaler4, num_gan_data)
