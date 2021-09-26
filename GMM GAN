@@ -266,7 +266,6 @@ def process_data(data, batch_size):
     return train_loader
 
 
-
 if __name__=='__main__':
     # hyper-parameters
     num_gan_data=100000
